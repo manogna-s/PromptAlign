@@ -34,7 +34,6 @@ import numpy as np
 # from dassl.utils.tpt_tools import AverageMeter as AverageMeter_TPT
 from utils.tools import Summary, ProgressMeter, accuracy, load_model_weight, set_random_seed
 from utils.tools import AverageMeter as AverageMeter_TPT
-import datasets.augmix_ops as augmentations
 import time
 from tqdm import tqdm
 ################################
@@ -61,36 +60,13 @@ def load_clip_to_cpu(cfg):
 
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
-    design_details = {"trainer": 'PromptAlign',
+    design_details = {"trainer": 'CoOp',
                       "vision_depth": 0,
                       "language_depth": 0, "vision_ctx": 0,
-                      "language_ctx": 0,
-                      "maple_length": cfg.TRAINER.PROMPTALIGN.N_CTX}
-    model = clip.build_model(state_dict or model.state_dict(), design_details)
-
-    return model
-
-def load_clip_to_cpu_dummy(cfg):
-    backbone_name = cfg.MODEL.BACKBONE.NAME
-    url = clip._MODELS[backbone_name]
-    model_path = clip._download(url)
-
-    try:
-        # loading JIT archive
-        model = torch.jit.load(model_path, map_location="cpu").eval()
-        state_dict = None
-
-    except RuntimeError:
-        state_dict = torch.load(model_path, map_location="cpu")
-    design_details = {"trainer": 'IVLP',
-                      "vision_depth": 0,
-                      "language_depth": 0, 
-                      "vision_ctx": 0,
                       "language_ctx": 0}
     model = clip.build_model(state_dict or model.state_dict(), design_details)
 
     return model
-
 
 class TextEncoder(nn.Module):
     def __init__(self, clip_model):
@@ -101,227 +77,132 @@ class TextEncoder(nn.Module):
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
 
-    def forward(self, prompts, tokenized_prompts, compound_prompts_deeper_text):
+    def forward(self, prompts, tokenized_prompts):
         x = prompts + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        # Pass as the list, as nn.sequential cannot process multiple arguments in the forward pass
-        combined = [x, compound_prompts_deeper_text, 0]  # third argument is the counter which denotes depth of prompt
-        outputs = self.transformer(combined)
-        x = outputs[0]  # extract the x back from here
+        x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(
+            dim=-1)] @ self.text_projection
 
         return x
 
 
-class MultiModalPromptLearner(nn.Module):
+class PromptLearner(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
-        self.learned_cls = False  # Just copied, check if setting to True
         n_cls = len(classnames)
-        n_ctx = cfg.TRAINER.PROMPTALIGN.N_CTX
-        ctx_init = cfg.TRAINER.PROMPTALIGN.CTX_INIT
+        n_ctx = 4 # cfg.TRAINER.COOP.N_CTX
+        ctx_init = "A photo of a" #cfg.TRAINER.COOP.CTX_INIT
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
-        # Default is 1, which is compound shallow prompting
-        assert cfg.TRAINER.PROMPTALIGN.PROMPT_DEPTH >= 1, "For MaPLe, PROMPT_DEPTH should be >= 1"
-        self.compound_prompts_depth = cfg.TRAINER.PROMPTALIGN.PROMPT_DEPTH  # max=12, but will create 11 such shared prompts
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
-        if ctx_init and (n_ctx) <= 4:
+        if ctx_init:
             # use given words to initialize context vectors
             ctx_init = ctx_init.replace("_", " ")
-            n_ctx = n_ctx
+            n_ctx = len(ctx_init.split(" "))
+            # prompt shape = [1, 77]: ['SOS', 'A', 'photo', 'of', 'a', 'EOS', 0...]
             prompt = clip.tokenize(ctx_init)
             with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(dtype)
-            ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
+                embedding = clip_model.token_embedding(
+                    prompt).type(dtype)   # embedding shape: [1, 77, 512]
+            ctx_vectors = embedding[0, 1: 1 + n_ctx, :]    # shape: [4, 512]
             prompt_prefix = ctx_init
+
         else:
             # random initialization
-            ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+            if cfg.TRAINER.COOP.CSC:
+                print("Initializing class-specific contexts")
+                ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
+            else:
+                print("Initializing a generic context")
+                ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
             nn.init.normal_(ctx_vectors, std=0.02)
             prompt_prefix = " ".join(["X"] * n_ctx)
-        print('MaPLe design: Multi-modal Prompt Learning')
+
         print(f'Initial context: "{prompt_prefix}"')
-        print(f"Number of MaPLe context words (tokens): {n_ctx}")
-        # These below, related to the shallow prompts
-        # Linear layer so that the tokens will project to 512 and will be initialized from 768
-        self.proj = nn.Linear(ctx_dim, 768)
-        # self.proj.half()
+        print(f"Number of context words (tokens): {n_ctx}")
+
+        # to be optimized; shape: [4, 512]
         self.ctx = nn.Parameter(ctx_vectors)
-        self.proj_weight_init_state = self.proj.weight.detach().clone()
-        self.proj_bias_init_state = self.proj.bias.detach().clone()
-        self.ctx_init_state = ctx_vectors.detach().clone()
-
-        # These below parameters related to the shared prompts
-        # Define the compound prompts for the deeper layers
-
-        # Minimum can be 1, which defaults to shallow MaPLe
-        # compound prompts
-        self.compound_prompts_text = nn.ParameterList([nn.Parameter(torch.empty(n_ctx, 512))
-                                                      for _ in range(self.compound_prompts_depth - 1)])
-        for single_para in self.compound_prompts_text:
-            nn.init.normal_(single_para, std=0.02)
-        # Copy init state
-        self.compound_prompts_text_init_state = [txt_prompt.detach().clone() for txt_prompt in self.compound_prompts_text]
-
-        # Also make corresponding projection layers, for each prompt
-        single_layer = nn.Linear(ctx_dim, 768)
-        self.compound_prompt_projections = _get_clones(single_layer, self.compound_prompts_depth - 1)
-        self.compound_prompt_projections_init_state = [(module.weight.detach().clone(), module.bias.detach().clone()) for module in self.compound_prompt_projections]
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
+        # ["A photo of a aircraft carrier", "A photo of a alarm clock", ...]
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
 
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])  # (n_cls, n_tkn)
+        tokenized_prompts = torch.cat(
+            [clip.tokenize(p) for p in prompts])  # shape: [C, 77]
         with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+            embedding = clip_model.token_embedding(
+                tokenized_prompts).type(dtype)      # shape: [C, 77, 512]
 
         # These token vectors will be saved when in save_model(),
         # but they should be ignored in load_model() as we want to use
         # those computed using the current class names
-        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
+        # SOS; shape [C, 1, 512]
+        self.register_buffer("token_prefix", embedding[:, :1, :])
+        self.register_buffer(
+            "token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS ; shape: [C, 72, 512]
 
         self.n_cls = n_cls
         self.n_ctx = n_ctx
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         self.name_lens = name_lens
+        # self.class_token_position = cfg.TRAINER.COOP.CLASS_TOKEN_POSITION
 
-    def construct_prompts(self, ctx, prefix, suffix, label=None):
-        # dim0 is either batch_size (during training) or n_cls (during testing)
-        # ctx: context tokens, with shape of (dim0, n_ctx, ctx_dim)
-        # prefix: the sos token, with shape of (n_cls, 1, ctx_dim)
-        # suffix: remaining tokens, with shape of (n_cls, *, ctx_dim)
+    def forward(self):
+        ctx = self.ctx
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
 
-        if label is not None:
-            prefix = prefix[label]
-            suffix = suffix[label]
+        prefix = self.token_prefix
+        suffix = self.token_suffix
 
         prompts = torch.cat(
             [
-                prefix,  # (dim0, 1, dim)
-                ctx,  # (dim0, n_ctx, dim)
-                suffix,  # (dim0, *, dim)
+                prefix,  # (n_cls, 1, dim)
+                ctx,     # (n_cls, n_ctx, dim)
+                suffix,  # (n_cls, *, dim)
             ],
             dim=1,
         )
 
         return prompts
 
-    def forward(self):
-        ctx = self.ctx
-
-        if ctx.dim() == 2:
-            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
-
-        prefix = self.token_prefix
-        suffix = self.token_suffix
-        prompts = self.construct_prompts(ctx, prefix, suffix)
-
-        # Before returning, need to transform
-        # prompts to 768 for the visual side
-        visual_deep_prompts = []
-        for index, layer in enumerate(self.compound_prompt_projections):
-            visual_deep_prompts.append(layer(self.compound_prompts_text[index]))
-        # Now the other way around
-        # We will project the textual prompts from 512 to 768
-        return prompts, self.proj(self.ctx), self.compound_prompts_text, visual_deep_prompts   # pass here original, as for visual 768 is required
-    
-    def reset(self):
-        ctx_vectors = self.ctx_init_state
-        self.ctx.copy_(ctx_vectors) # to be optimized
-        if self.learned_cls:
-            cls_vectors = self.cls_init_state
-            self.cls.copy_(cls_vectors)
-
-        with torch.no_grad():
-            self.proj.weight.copy_(self.proj_weight_init_state)
-            self.proj.bias.copy_(self.proj_bias_init_state)
-
-            for idx, prompt in enumerate(self.compound_prompts_text):
-                prompt.copy_(self.compound_prompts_text_init_state[idx])
-            
-            for idx, module in enumerate(self.compound_prompt_projections):
-                module.weight.copy_(self.compound_prompt_projections_init_state[idx][0])
-                module.bias.copy_(self.compound_prompt_projections_init_state[idx][1])
-
-    def reset_classnames(self, classnames, args):
-        self.device = self.ctx.device
-        self.n_cls = len(classnames)
-        if not self.learned_cls:
-            classnames = [name.replace("_", " ") for name in classnames]
-            name_lens = [len(_tokenizer.encode(name)) for name in classnames]
-            prompts = [self.prompt_prefix + " " + name + "." for name in classnames]
-        else:
-            cls_vectors = torch.empty(self.n_cls, 1, self.ctx_dim, dtype=self.dtype) # assume each learnable cls_token is only 1 word
-            nn.init.normal_(cls_vectors, std=0.02)
-            cls_token = "X"
-            name_lens = [1 for _ in classnames]
-            prompts = [self.prompt_prefix + " " + cls_token + "." for _ in classnames]
-            # TODO: re-init the cls parameters
-            # self.cls = nn.Parameter(cls_vectors) # to be optimized
-            self.cls_init_state = cls_vectors.detach().clone()
-        tokenized_prompts = torch.cat([tokenize(p) for p in prompts]).to(self.device)
-
-        clip = load_clip_to_cpu(args).to(self.device)
-
-        with torch.no_grad():
-            embedding = clip.token_embedding(tokenized_prompts).type(self.dtype)
-
-        self.token_prefix = embedding[:, :1, :]
-        self.token_suffix = embedding[:, 1 + self.n_ctx :, :]  # CLS, EOS
-
-        self.name_lens = name_lens
-        self.tokenized_prompts = tokenized_prompts
-        self.classnames = classnames
-
-    def set_prompt_init_states(self):
-        '''
-        Store the initial prompts
-        '''
-        ctx_vectors = self.ctx.detach().clone()
-        self.ctx_init_state = ctx_vectors
-        self.proj_weight_init_state = self.proj.weight.detach().clone()
-        self.proj_bias_init_state = self.proj.bias.detach().clone()
-
-        self.compound_prompts_text_init_state = [txt_prompt.detach().clone() for txt_prompt in self.compound_prompts_text]
-        self.compound_prompt_projections_init_state = [(module.weight.detach().clone(), module.bias.detach().clone()) for module in self.compound_prompt_projections]
-
 
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
-        self.prompt_learner = MultiModalPromptLearner(cfg, classnames, clip_model)
+        self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
-    def forward(self, image, label=None):
-        tokenized_prompts = self.tokenized_prompts
+    def forward(self, image):
+        image_features = self.image_encoder(image.type(self.dtype))
+
+        prompts = self.prompt_learner()   # shape: [C, 77, 512]
+        tokenized_prompts = self.tokenized_prompts  # shape: [C, 77]
+        text_features = self.text_encoder(prompts, tokenized_prompts)
+
+        image_features = image_features / \
+            image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / \
+            text_features.norm(dim=-1, keepdim=True)
+
         logit_scale = self.logit_scale.exp()
-
-        prompts, shared_ctx, deep_compound_prompts_text, deep_compound_prompts_vision = self.prompt_learner()
-        text_features = self.text_encoder(prompts, tokenized_prompts, deep_compound_prompts_text)
-        image_features = self.image_encoder(image.type(self.dtype), shared_ctx, deep_compound_prompts_vision)
-
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         logits = logit_scale * image_features @ text_features.t()
 
-        if self.prompt_learner.training:
-            return F.cross_entropy(logits, label)
-               
         return logits
     
 
@@ -351,29 +232,7 @@ def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
 
-ID_to_DIRNAME={
-    'PUG': 'PUG_ImageNet',
-    'I': 'imagenet/images',
-    'A': 'imagenet-adversarial/imagenet-a',
-    'K': 'imagenet-sketch/ImageNet-Sketch',
-    'R': 'imagenet-rendition/imagenet-r',
-    'V': 'imagenetv2/imagenetv2-matched-frequency-format-val',
-    'DN-C': 'domainnet/clipart',
-    'DN-R': 'domainnet/real',
-    'DN-P': 'domainnet/painting',
-    'DN-S': 'domainnet/sketch',
-    'flower102': 'oxford_flowers',
-    'dtd': 'dtd',
-    'pets': 'oxford_pets',
-    'cars': 'stanford_cars',
-    'ucf101': 'ucf101',
-    'caltech101': 'caltech-101',
-    'food101': 'food-101',
-    'sun397': 'sun397',
-    'aircraft': 'fgvc_aircraft',
-    'eurosat': 'eurosat'
-}
-
+from trainers.prompt_align import ID_to_DIRNAME
 
 class BaseJsonDataset(Dataset):
     def __init__(self, image_path, json_path, mode='train', n_shot=None, transform=None):
@@ -519,11 +378,7 @@ class AugMixAugmenter(object):
         self.base_transform = base_transform
         self.preprocess = preprocess
         self.n_views = n_views
-        self.n_views = n_views
-        if augmix:
-            self.aug_list = augmentations.augmentations
-        else:
-            self.aug_list = []
+        self.aug_list = []
         self.severity = severity
         
     def __call__(self, x):
@@ -531,9 +386,50 @@ class AugMixAugmenter(object):
         views = [augmix(x, self.preprocess, self.aug_list, self.severity) for _ in range(self.n_views)]
         return [image] + views
 
+from PIL import Image
+from torch.utils.data import Dataset
+from typing import Sequence, Callable, Optional
+class ImageList(Dataset):
+    def __init__(
+        self,
+        image_root: str,
+        label_files: Sequence[str],
+        transform: Optional[Callable] = None
+    ):
+        self.image_root = image_root
+        self.label_files = label_files
+        self.transform = transform
 
+        self.samples = []
+        for file in label_files:
+            self.samples += self.build_index(label_file=file)
+
+    def build_index(self, label_file):
+        with open(label_file, "r") as file:
+            tmp_items = [line.strip().split() for line in file if line]
+
+        item_list = []
+        for img_file, label in tmp_items:
+            img_file = f"{os.sep}".join(img_file.split("/"))
+            img_path = os.path.join(self.image_root, img_file)
+            domain_name = img_file.split(os.sep)[0]
+            item_list.append((img_path, int(label), domain_name))
+
+        return item_list
+
+    def __getitem__(self, idx):
+        img_path, label, domain = self.samples[idx]
+        img = Image.open(img_path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+
+        return img, label
+
+    def __len__(self):
+        return len(self.samples)
+    
 @TRAINER_REGISTRY.register()
-class PromptAlign(TrainerX):
+class CoOpZS(TrainerX):
     def save_feature_maps(self, save_path='./output/features/'):
         '''
         Saving feature maps (i.e. tokens from transformer)
@@ -573,7 +469,8 @@ class PromptAlign(TrainerX):
             testdir = os.path.join(data_root, ID_to_DIRNAME[set_id])
             testset = datasets.ImageFolder(testdir, transform=transform)
         elif set_id in ['DN-R', 'DN-C', 'DN-P', 'DN-S']:
-            from trainers.coop_zs import ImageList
+            # testdir = os.path.join(data_root, ID_to_DIRNAME[set_id])
+            # testset = datasets.ImageFolder(testdir, transform=transform)
             domain = {'DN-R':'real', 'DN-C':'clipart', 'DN-P': 'painting', 'DN-S': 'sketch'}
             testset = ImageList(image_root='/home/manogna/TTA/PromptAlign/data/domainnet',
                                     label_files=[f'/home/manogna/TTA/PromptAlign/data/domainnet/domainnet126_lists/{domain[set_id]}_list.txt'],
@@ -605,7 +502,8 @@ class PromptAlign(TrainerX):
         if tpt:
             base_transform = transforms.Compose([
                 transforms.Resize(224, interpolation=BICUBIC),
-                transforms.CenterCrop(224)])
+                transforms.CenterCrop(224)]
+                )
             preprocess = transforms.Compose([
                 transforms.ToTensor(),
                 normalize])
@@ -626,7 +524,7 @@ class PromptAlign(TrainerX):
         # print("number of test samples: {}".format(len(val_dataset)))
         val_loader = torch.utils.data.DataLoader(
                     val_dataset,
-                    batch_size=batchsize, shuffle=True,
+                    batch_size=batchsize, shuffle=False,
                     num_workers=8, pin_memory=True)
         
         return val_loader
@@ -635,7 +533,7 @@ class PromptAlign(TrainerX):
         """
         Run Test-time prompt Tuning
         """
-        self.model.set_prompt_inits()   # Init with current prompts
+        # self.model.set_prompt_inits()   # Init with current prompts
         for name, param in self.model.named_parameters():
             if not self.cfg.TPT.COCOOP: # MaPLe and CoOp
                 if "prompt_learner" not in name:
@@ -681,47 +579,17 @@ class PromptAlign(TrainerX):
 
         # reset model and switch to evaluate mode
         model.eval()
-        if not args.COCOOP: # no need to reset cocoop because it's fixed
-            with torch.no_grad():
-                model.reset()
+        # if not args.COCOOP: # no need to reset cocoop because it's fixed
+            # with torch.no_grad():
+                # model.reset()
         end = time.time()
         for i, batch in enumerate(val_loader):
             # images, target = self.parse_batch_test(batch)
             images, target = batch
-            # assert args.gpu is not None
-            if isinstance(images, list):
-                for k in range(len(images)):
-                    # images[k] = images[k].cuda(args.gpu, non_blocking=True)
-                    images[k] = images[k].to(self.device)
-                image = images[0]
-            else:
-                if len(images.size()) > 4:
-                    # when using ImageNet Sampler as the dataset
-                    assert images.size()[0] == 1
-                    images = images.squeeze(0)
-                # images = images.cuda(args.gpu, non_blocking=True)
-                images = images.to(self.device)
-                image = images
-            # target = target.cuda(args.gpu, non_blocking=True)
-            target = target.to(self.device)
-            if args.RUN:
-                images = torch.cat(images, dim=0)
-
-            # reset the tunable prompt to its initial state
-            if not args.COCOOP: # no need to reset cocoop because it's fixed
-                if args.TTA_STEPS > 0:
-                    with torch.no_grad():
-                        model.reset()
-                optimizer.load_state_dict(optim_state)
-                self.test_time_tuning(model, images, optimizer, scaler, args)
-            else:
-                with torch.no_grad():
-                    with torch.cuda.amp.autocast():
-                        image_feature, pgen_ctx = model.gen_ctx(images, args.RUN)
-                optimizer = None
-                pgen_ctx = self.test_time_tuning(model, (image_feature, pgen_ctx), optimizer, scaler, args)
 
             # The actual inference goes here
+            image = images[0].to(self.device)
+            target = target.to(self.device)
             if args.RUN:
                 if args.COCOOP:
                     image_feature = image_feature[0].unsqueeze(0)
@@ -749,82 +617,6 @@ class PromptAlign(TrainerX):
         progress.display_summary()
 
         return [top1.avg, top5.avg]
-
-    def test_time_tuning(self, model, inputs, optimizer, scaler, args):
-        if args.COCOOP:
-            image_feature, pgen_ctx = inputs
-            pgen_ctx.requires_grad = True
-            optimizer = torch.optim.AdamW([pgen_ctx], args.LR)
-        
-        selected_idx = None
-        for j in range(args.TTA_STEPS):
-            with torch.cuda.amp.autocast():
-                if args.COCOOP:
-                    output = model((image_feature, pgen_ctx))
-                else:
-                    output = model(inputs) 
-
-                if selected_idx is not None:
-                    output = output[selected_idx]
-                else:
-                    output, selected_idx = self.select_confident_samples(output, args.TPT_THRESHOLD, args.ALIGN_THRESHOLD)
-
-                if args.TPT_LOSS:
-                    loss = self.avg_entropy(output)
-
-                # Only selected indexes
-                target_feat_distr = (self.visual_means, self.visual_vars)
-                out_visual_mean = torch.cat([torch.mean(res.visual_feat[:, selected_idx, :], dim=1, keepdims=True).permute(1,0,2) for res in model.image_encoder.transformer.resblocks])
-                out_visual_var = torch.cat([torch.mean(((res.visual_feat[:, selected_idx, :] - out_visual_mean[i, :, :].unsqueeze(0).permute(1,0,2))**2), dim=1, keepdims=True).permute(1,0,2) for i, res in enumerate(model.image_encoder.transformer.resblocks)])
-                out_feat_distr = (out_visual_mean, out_visual_var)
-
-                if args.DISTR_ALIGN:
-                    DISTR_LOSS_W = args.DISTR_LOSS_W / (args.ALIGN_LAYER_TO - args.ALIGN_LAYER_FROM)
-                    if not args.TPT_LOSS:
-                        loss = DISTR_LOSS_W * self.distr_align_loss(out_feat_distr, target_feat_distr, 
-                                                layers_from=args.ALIGN_LAYER_FROM, layers_to=args.ALIGN_LAYER_TO)
-                    else: 
-                        loss += DISTR_LOSS_W * self.distr_align_loss(out_feat_distr, target_feat_distr, 
-                                                layers_from=args.ALIGN_LAYER_FROM, layers_to=args.ALIGN_LAYER_TO)
-            
-            optimizer.zero_grad()
-            # compute gradient and do SGD step
-            scaler.scale(loss).backward()
-            # Unscales the gradients of optimizer's assigned params in-place
-            scaler.step(optimizer)
-            scaler.update()
-        if args.COCOOP:
-            return pgen_ctx
-
-        return
-    
-    def select_confident_samples(self, logits, topTPT, topAlign):
-        n_select = {4:1, 8:2, 16:2, 32:3, 64:6}
-        batch_entropy = -(logits.softmax(1) * logits.log_softmax(1)).sum(1)
-        idxTPT = torch.argsort(batch_entropy, descending=False)[:n_select[batch_entropy.size()[0]]] #[:int(batch_entropy.size()[0] * topTPT)]
-        idxAlign = torch.argsort(batch_entropy, descending=False)[:n_select[batch_entropy.size()[0]]] #[:int(batch_entropy.size()[0] * topAlign)]
-        return logits[idxTPT], idxAlign
-
-    def avg_entropy(self, outputs):
-        logits = outputs - outputs.logsumexp(dim=-1, keepdim=True) # logits = outputs.log_softmax(dim=1) [N, 1000]
-        avg_logits = logits.logsumexp(dim=0) - np.log(logits.shape[0]) # avg_logits = logits.mean(0) [1, 1000]
-        min_real = torch.finfo(avg_logits.dtype).min
-        avg_logits = torch.clamp(avg_logits, min=min_real)
-        return -(avg_logits * torch.exp(avg_logits)).sum(dim=-1)
-    
-    def distr_align_loss(self, out_feat, targ_feat, layers_from=0, layers_to=12, moments=5):
-        '''
-        A feature distibution alignment L1 loss between mean and variance of the features
-        '''
-        distr_loss = 0
-        out_means, out_vars = out_feat
-        targ_means, targ_vars = targ_feat
-        transf_layers = layers_to
-        for l in range(layers_from, transf_layers-1):
-            out_mean, out_var = out_means[l], out_vars[l]
-            targ_mean, targ_var = targ_means[l], targ_vars[l]
-            distr_loss += 0.5 * F.l1_loss(out_mean, targ_mean) + 0.5 * F.l1_loss(out_var, targ_var)
-        return distr_loss
 
     @torch.no_grad()
     def test(self, split=None):
@@ -981,6 +773,9 @@ class PromptAlign(TrainerX):
 
             if "prompt_learner.token_suffix" in state_dict:
                 del state_dict["prompt_learner.token_suffix"]
+
+            if "prompt_learner.ctx" in state_dict:
+                del state_dict["prompt_learner.ctx"]
 
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False

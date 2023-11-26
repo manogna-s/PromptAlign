@@ -34,7 +34,6 @@ import numpy as np
 # from dassl.utils.tpt_tools import AverageMeter as AverageMeter_TPT
 from utils.tools import Summary, ProgressMeter, accuracy, load_model_weight, set_random_seed
 from utils.tools import AverageMeter as AverageMeter_TPT
-import datasets.augmix_ops as augmentations
 import time
 from tqdm import tqdm
 ################################
@@ -351,29 +350,7 @@ def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
 
-ID_to_DIRNAME={
-    'PUG': 'PUG_ImageNet',
-    'I': 'imagenet/images',
-    'A': 'imagenet-adversarial/imagenet-a',
-    'K': 'imagenet-sketch/ImageNet-Sketch',
-    'R': 'imagenet-rendition/imagenet-r',
-    'V': 'imagenetv2/imagenetv2-matched-frequency-format-val',
-    'DN-C': 'domainnet/clipart',
-    'DN-R': 'domainnet/real',
-    'DN-P': 'domainnet/painting',
-    'DN-S': 'domainnet/sketch',
-    'flower102': 'oxford_flowers',
-    'dtd': 'dtd',
-    'pets': 'oxford_pets',
-    'cars': 'stanford_cars',
-    'ucf101': 'ucf101',
-    'caltech101': 'caltech-101',
-    'food101': 'food-101',
-    'sun397': 'sun397',
-    'aircraft': 'fgvc_aircraft',
-    'eurosat': 'eurosat'
-}
-
+from trainers.prompt_align import ID_to_DIRNAME
 
 class BaseJsonDataset(Dataset):
     def __init__(self, image_path, json_path, mode='train', n_shot=None, transform=None):
@@ -519,11 +496,7 @@ class AugMixAugmenter(object):
         self.base_transform = base_transform
         self.preprocess = preprocess
         self.n_views = n_views
-        self.n_views = n_views
-        if augmix:
-            self.aug_list = augmentations.augmentations
-        else:
-            self.aug_list = []
+        self.aug_list = []
         self.severity = severity
         
     def __call__(self, x):
@@ -533,7 +506,7 @@ class AugMixAugmenter(object):
 
 
 @TRAINER_REGISTRY.register()
-class PromptAlign(TrainerX):
+class MapleZSAug(TrainerX):
     def save_feature_maps(self, save_path='./output/features/'):
         '''
         Saving feature maps (i.e. tokens from transformer)
@@ -573,11 +546,8 @@ class PromptAlign(TrainerX):
             testdir = os.path.join(data_root, ID_to_DIRNAME[set_id])
             testset = datasets.ImageFolder(testdir, transform=transform)
         elif set_id in ['DN-R', 'DN-C', 'DN-P', 'DN-S']:
-            from trainers.coop_zs import ImageList
-            domain = {'DN-R':'real', 'DN-C':'clipart', 'DN-P': 'painting', 'DN-S': 'sketch'}
-            testset = ImageList(image_root='/home/manogna/TTA/PromptAlign/data/domainnet',
-                                    label_files=[f'/home/manogna/TTA/PromptAlign/data/domainnet/domainnet126_lists/{domain[set_id]}_list.txt'],
-                                    transform=transform)
+            testdir = os.path.join(data_root, ID_to_DIRNAME[set_id])
+            testset = datasets.ImageFolder(testdir, transform=transform)
         elif set_id in fewshot_datasets:
             if mode == 'train' and n_shot:
                 testset = self.build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode, n_shot=n_shot)
@@ -707,19 +677,19 @@ class PromptAlign(TrainerX):
             if args.RUN:
                 images = torch.cat(images, dim=0)
 
-            # reset the tunable prompt to its initial state
-            if not args.COCOOP: # no need to reset cocoop because it's fixed
-                if args.TTA_STEPS > 0:
-                    with torch.no_grad():
-                        model.reset()
-                optimizer.load_state_dict(optim_state)
-                self.test_time_tuning(model, images, optimizer, scaler, args)
-            else:
-                with torch.no_grad():
-                    with torch.cuda.amp.autocast():
-                        image_feature, pgen_ctx = model.gen_ctx(images, args.RUN)
-                optimizer = None
-                pgen_ctx = self.test_time_tuning(model, (image_feature, pgen_ctx), optimizer, scaler, args)
+            # # reset the tunable prompt to its initial state
+            # if not args.COCOOP: # no need to reset cocoop because it's fixed
+            #     if args.TTA_STEPS > 0:
+            #         with torch.no_grad():
+            #             model.reset()
+            #     optimizer.load_state_dict(optim_state)
+            #     self.test_time_tuning(model, images, optimizer, scaler, args)
+            # else:
+            #     with torch.no_grad():
+            #         with torch.cuda.amp.autocast():
+            #             image_feature, pgen_ctx = model.gen_ctx(images, args.RUN)
+            #     optimizer = None
+                # pgen_ctx = self.test_time_tuning(model, (image_feature, pgen_ctx), optimizer, scaler, args)
 
             # The actual inference goes here
             if args.RUN:
@@ -731,7 +701,8 @@ class PromptAlign(TrainerX):
                     if args.COCOOP:
                         output = model((image_feature, pgen_ctx))
                     else:
-                        output = model(image)
+                        outputs = model(images) #aggregate augmented preds
+                        output = outputs.mean(0).unsqueeze(0)
 
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))

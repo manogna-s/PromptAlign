@@ -34,7 +34,6 @@ import numpy as np
 # from dassl.utils.tpt_tools import AverageMeter as AverageMeter_TPT
 from utils.tools import Summary, ProgressMeter, accuracy, load_model_weight, set_random_seed
 from utils.tools import AverageMeter as AverageMeter_TPT
-import datasets.augmix_ops as augmentations
 import time
 from tqdm import tqdm
 ################################
@@ -351,29 +350,7 @@ def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
 
-ID_to_DIRNAME={
-    'PUG': 'PUG_ImageNet',
-    'I': 'imagenet/images',
-    'A': 'imagenet-adversarial/imagenet-a',
-    'K': 'imagenet-sketch/ImageNet-Sketch',
-    'R': 'imagenet-rendition/imagenet-r',
-    'V': 'imagenetv2/imagenetv2-matched-frequency-format-val',
-    'DN-C': 'domainnet/clipart',
-    'DN-R': 'domainnet/real',
-    'DN-P': 'domainnet/painting',
-    'DN-S': 'domainnet/sketch',
-    'flower102': 'oxford_flowers',
-    'dtd': 'dtd',
-    'pets': 'oxford_pets',
-    'cars': 'stanford_cars',
-    'ucf101': 'ucf101',
-    'caltech101': 'caltech-101',
-    'food101': 'food-101',
-    'sun397': 'sun397',
-    'aircraft': 'fgvc_aircraft',
-    'eurosat': 'eurosat'
-}
-
+from trainers.prompt_align import ID_to_DIRNAME
 
 class BaseJsonDataset(Dataset):
     def __init__(self, image_path, json_path, mode='train', n_shot=None, transform=None):
@@ -519,11 +496,7 @@ class AugMixAugmenter(object):
         self.base_transform = base_transform
         self.preprocess = preprocess
         self.n_views = n_views
-        self.n_views = n_views
-        if augmix:
-            self.aug_list = augmentations.augmentations
-        else:
-            self.aug_list = []
+        self.aug_list = []
         self.severity = severity
         
     def __call__(self, x):
@@ -533,7 +506,7 @@ class AugMixAugmenter(object):
 
 
 @TRAINER_REGISTRY.register()
-class PromptAlign(TrainerX):
+class MapleZS(TrainerX):
     def save_feature_maps(self, save_path='./output/features/'):
         '''
         Saving feature maps (i.e. tokens from transformer)
@@ -622,6 +595,7 @@ class PromptAlign(TrainerX):
             batchsize = args.BATCH_SIZE
 
         set_id = self.cfg.DATASET.TPT
+        print(set_id, data_transform, self.cfg.DATASET.ROOT)
         val_dataset = self.build_dataset(set_id, data_transform, self.cfg.DATASET.ROOT, mode='test')
         # print("number of test samples: {}".format(len(val_dataset)))
         val_loader = torch.utils.data.DataLoader(
@@ -688,40 +662,10 @@ class PromptAlign(TrainerX):
         for i, batch in enumerate(val_loader):
             # images, target = self.parse_batch_test(batch)
             images, target = batch
-            # assert args.gpu is not None
-            if isinstance(images, list):
-                for k in range(len(images)):
-                    # images[k] = images[k].cuda(args.gpu, non_blocking=True)
-                    images[k] = images[k].to(self.device)
-                image = images[0]
-            else:
-                if len(images.size()) > 4:
-                    # when using ImageNet Sampler as the dataset
-                    assert images.size()[0] == 1
-                    images = images.squeeze(0)
-                # images = images.cuda(args.gpu, non_blocking=True)
-                images = images.to(self.device)
-                image = images
-            # target = target.cuda(args.gpu, non_blocking=True)
-            target = target.to(self.device)
-            if args.RUN:
-                images = torch.cat(images, dim=0)
-
-            # reset the tunable prompt to its initial state
-            if not args.COCOOP: # no need to reset cocoop because it's fixed
-                if args.TTA_STEPS > 0:
-                    with torch.no_grad():
-                        model.reset()
-                optimizer.load_state_dict(optim_state)
-                self.test_time_tuning(model, images, optimizer, scaler, args)
-            else:
-                with torch.no_grad():
-                    with torch.cuda.amp.autocast():
-                        image_feature, pgen_ctx = model.gen_ctx(images, args.RUN)
-                optimizer = None
-                pgen_ctx = self.test_time_tuning(model, (image_feature, pgen_ctx), optimizer, scaler, args)
 
             # The actual inference goes here
+            image = images[0].to(self.device)
+            target = target.to(self.device)
             if args.RUN:
                 if args.COCOOP:
                     image_feature = image_feature[0].unsqueeze(0)
@@ -749,82 +693,6 @@ class PromptAlign(TrainerX):
         progress.display_summary()
 
         return [top1.avg, top5.avg]
-
-    def test_time_tuning(self, model, inputs, optimizer, scaler, args):
-        if args.COCOOP:
-            image_feature, pgen_ctx = inputs
-            pgen_ctx.requires_grad = True
-            optimizer = torch.optim.AdamW([pgen_ctx], args.LR)
-        
-        selected_idx = None
-        for j in range(args.TTA_STEPS):
-            with torch.cuda.amp.autocast():
-                if args.COCOOP:
-                    output = model((image_feature, pgen_ctx))
-                else:
-                    output = model(inputs) 
-
-                if selected_idx is not None:
-                    output = output[selected_idx]
-                else:
-                    output, selected_idx = self.select_confident_samples(output, args.TPT_THRESHOLD, args.ALIGN_THRESHOLD)
-
-                if args.TPT_LOSS:
-                    loss = self.avg_entropy(output)
-
-                # Only selected indexes
-                target_feat_distr = (self.visual_means, self.visual_vars)
-                out_visual_mean = torch.cat([torch.mean(res.visual_feat[:, selected_idx, :], dim=1, keepdims=True).permute(1,0,2) for res in model.image_encoder.transformer.resblocks])
-                out_visual_var = torch.cat([torch.mean(((res.visual_feat[:, selected_idx, :] - out_visual_mean[i, :, :].unsqueeze(0).permute(1,0,2))**2), dim=1, keepdims=True).permute(1,0,2) for i, res in enumerate(model.image_encoder.transformer.resblocks)])
-                out_feat_distr = (out_visual_mean, out_visual_var)
-
-                if args.DISTR_ALIGN:
-                    DISTR_LOSS_W = args.DISTR_LOSS_W / (args.ALIGN_LAYER_TO - args.ALIGN_LAYER_FROM)
-                    if not args.TPT_LOSS:
-                        loss = DISTR_LOSS_W * self.distr_align_loss(out_feat_distr, target_feat_distr, 
-                                                layers_from=args.ALIGN_LAYER_FROM, layers_to=args.ALIGN_LAYER_TO)
-                    else: 
-                        loss += DISTR_LOSS_W * self.distr_align_loss(out_feat_distr, target_feat_distr, 
-                                                layers_from=args.ALIGN_LAYER_FROM, layers_to=args.ALIGN_LAYER_TO)
-            
-            optimizer.zero_grad()
-            # compute gradient and do SGD step
-            scaler.scale(loss).backward()
-            # Unscales the gradients of optimizer's assigned params in-place
-            scaler.step(optimizer)
-            scaler.update()
-        if args.COCOOP:
-            return pgen_ctx
-
-        return
-    
-    def select_confident_samples(self, logits, topTPT, topAlign):
-        n_select = {4:1, 8:2, 16:2, 32:3, 64:6}
-        batch_entropy = -(logits.softmax(1) * logits.log_softmax(1)).sum(1)
-        idxTPT = torch.argsort(batch_entropy, descending=False)[:n_select[batch_entropy.size()[0]]] #[:int(batch_entropy.size()[0] * topTPT)]
-        idxAlign = torch.argsort(batch_entropy, descending=False)[:n_select[batch_entropy.size()[0]]] #[:int(batch_entropy.size()[0] * topAlign)]
-        return logits[idxTPT], idxAlign
-
-    def avg_entropy(self, outputs):
-        logits = outputs - outputs.logsumexp(dim=-1, keepdim=True) # logits = outputs.log_softmax(dim=1) [N, 1000]
-        avg_logits = logits.logsumexp(dim=0) - np.log(logits.shape[0]) # avg_logits = logits.mean(0) [1, 1000]
-        min_real = torch.finfo(avg_logits.dtype).min
-        avg_logits = torch.clamp(avg_logits, min=min_real)
-        return -(avg_logits * torch.exp(avg_logits)).sum(dim=-1)
-    
-    def distr_align_loss(self, out_feat, targ_feat, layers_from=0, layers_to=12, moments=5):
-        '''
-        A feature distibution alignment L1 loss between mean and variance of the features
-        '''
-        distr_loss = 0
-        out_means, out_vars = out_feat
-        targ_means, targ_vars = targ_feat
-        transf_layers = layers_to
-        for l in range(layers_from, transf_layers-1):
-            out_mean, out_var = out_means[l], out_vars[l]
-            targ_mean, targ_var = targ_means[l], targ_vars[l]
-            distr_loss += 0.5 * F.l1_loss(out_mean, targ_mean) + 0.5 * F.l1_loss(out_var, targ_var)
-        return distr_loss
 
     @torch.no_grad()
     def test(self, split=None):

@@ -23,9 +23,12 @@ import datasets.imagenetv2
 import datasets.imagenet_a
 import datasets.imagenet_r
 import datasets.pug
+import datasets.domainnet
 
-# import trainers.maple
+import trainers.maple_zs
+import trainers.maple_zs_aug
 import trainers.prompt_align
+import trainers.coop_zs
 
 from pdb import set_trace as stx
 
