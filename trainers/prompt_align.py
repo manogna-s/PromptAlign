@@ -610,7 +610,7 @@ class PromptAlign(TrainerX):
                 transforms.ToTensor(),
                 normalize])
             data_transform = AugMixAugmenter(base_transform, preprocess, n_views=args.BATCH_SIZE-1, 
-                                            augmix=False)
+                                            augmix=True)
             batchsize = 1
         else:
             data_transform = transforms.Compose([
@@ -668,12 +668,14 @@ class PromptAlign(TrainerX):
     
     def test_time_adapt_eval(self, val_loader, model, optimizer, optim_state, scaler, args):
         batch_time = AverageMeter_TPT('Time', ':6.3f', Summary.NONE)
+        pre_top1 = AverageMeter_TPT('Pre_Acc@1', ':6.2f', Summary.AVERAGE)
+        pre_sel_top1 = AverageMeter_TPT('PreSel_Acc@1', ':6.2f', Summary.AVERAGE)
         top1 = AverageMeter_TPT('Acc@1', ':6.2f', Summary.AVERAGE)
         top5 = AverageMeter_TPT('Acc@5', ':6.2f', Summary.AVERAGE)
 
         progress = ProgressMeter(
             len(val_loader),
-            [batch_time, top1, top5],
+            [batch_time, pre_top1, pre_sel_top1, top1, top5],
             prefix='Test: ')
         print("$"*40)
         print(f"Running for {args.BATCH_SIZE} Augmented views")
@@ -713,7 +715,7 @@ class PromptAlign(TrainerX):
                     with torch.no_grad():
                         model.reset()
                 optimizer.load_state_dict(optim_state)
-                self.test_time_tuning(model, images, optimizer, scaler, args)
+                outputs_all, outputs_sel = self.test_time_tuning(model, images, optimizer, scaler, args)
             else:
                 with torch.no_grad():
                     with torch.cuda.amp.autocast():
@@ -734,8 +736,15 @@ class PromptAlign(TrainerX):
                         output = model(image)
 
             # measure accuracy and record loss
+            pre_acc1, pre_acc5 = accuracy(outputs_all.mean(0).unsqueeze(0), target, topk=(1, 5))
+            pre_sel_acc1, pre_acc5 = accuracy(outputs_sel.mean(0).unsqueeze(0), target, topk=(1, 5))
+            
+            pre_top1.update(pre_acc1[0], image.size(0))
+            
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
                     
+            pre_top1.update(pre_acc1[0], image.size(0))
+            pre_sel_top1.update(pre_sel_acc1[0], image.size(0))
             top1.update(acc1[0], image.size(0))
             top5.update(acc5[0], image.size(0))
 
@@ -757,17 +766,19 @@ class PromptAlign(TrainerX):
             optimizer = torch.optim.AdamW([pgen_ctx], args.LR)
         
         selected_idx = None
+        state_dict = torch.load('finetune_model.pt')
+        model.load_state_dict(state_dict)
         for j in range(args.TTA_STEPS):
             with torch.cuda.amp.autocast():
                 if args.COCOOP:
-                    output = model((image_feature, pgen_ctx))
+                    outputs_all = model((image_feature, pgen_ctx))
                 else:
-                    output = model(inputs) 
+                    outputs_all = model(inputs)
 
                 if selected_idx is not None:
-                    output = output[selected_idx]
+                    output = outputs_all[selected_idx]
                 else:
-                    output, selected_idx = self.select_confident_samples(output, args.TPT_THRESHOLD, args.ALIGN_THRESHOLD)
+                    output, selected_idx = self.select_confident_samples(outputs_all, args.TPT_THRESHOLD, args.ALIGN_THRESHOLD)
 
                 if args.TPT_LOSS:
                     loss = self.avg_entropy(output)
@@ -796,7 +807,7 @@ class PromptAlign(TrainerX):
         if args.COCOOP:
             return pgen_ctx
 
-        return
+        return [outputs_all, output]
     
     def select_confident_samples(self, logits, topTPT, topAlign):
         n_select = {4:1, 8:2, 16:2, 32:3, 64:6}
@@ -912,10 +923,10 @@ class PromptAlign(TrainerX):
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
-        device_count = torch.cuda.device_count()
-        if device_count > 1:
-            print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
-            self.model = nn.DataParallel(self.model)
+        # device_count = torch.cuda.device_count()
+        # if device_count > 1:
+        #     print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
+        #     self.model = nn.DataParallel(self.model)
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)

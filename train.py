@@ -29,6 +29,8 @@ import trainers.maple_zs
 import trainers.maple_zs_aug
 import trainers.prompt_align
 import trainers.coop_zs
+import trainers.prompt_align_batch
+import trainers.prompt_align_batch_train
 
 from pdb import set_trace as stx
 
@@ -106,6 +108,7 @@ def extend_cfg(cfg):
     cfg.TPT.RUN = True  # Run TPT using TPT dataloader
     cfg.TPT.LR = 4e-2   # Learning rate for TPT
     cfg.TPT.COCOOP = False
+    cfg.TPT.CTTA = False
     cfg.TPT.ALIGN_LAYER_FROM = 0
     cfg.TPT.ALIGN_LAYER_TO = 3
     cfg.TPT.TTA_STEPS = 1
@@ -114,6 +117,7 @@ def extend_cfg(cfg):
     cfg.TPT.ALIGN_THRESHOLD = 0.1
     cfg.TPT.TPT_LOSS = True
     cfg.TPT.DISTR_LOSS_W = 100.0
+    cfg.TPT.N_VIEWS = 64
     cfg.TPT.BATCH_SIZE = 64
     cfg.TPT.VIS_MEANS = './output/features/ImgNetpre_vis_means.pt'  # Path to means of source dataset for vision branch
     cfg.TPT.VIS_VARS = './output/features/ImgNetpre_vis_vars.pt'    # Path to variances of source dataset for vision branch
