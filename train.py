@@ -25,12 +25,10 @@ import datasets.imagenet_r
 import datasets.pug
 import datasets.domainnet
 
-import trainers.maple_zs
-import trainers.maple_zs_aug
 import trainers.prompt_align
 import trainers.coop_zs
-import trainers.prompt_align_batch
-import trainers.prompt_align_batch_train
+import trainers.group_ema
+
 
 from pdb import set_trace as stx
 
@@ -121,6 +119,17 @@ def extend_cfg(cfg):
     cfg.TPT.BATCH_SIZE = 64
     cfg.TPT.VIS_MEANS = './output/features/ImgNetpre_vis_means.pt'  # Path to means of source dataset for vision branch
     cfg.TPT.VIS_VARS = './output/features/ImgNetpre_vis_vars.pt'    # Path to variances of source dataset for vision branch
+    #added by Manogna
+    cfg.TPT.N_VIEWS = 64
+    cfg.TPT.AUG_LOSS = False
+    cfg.TPT.PLOGA_LOSS = False
+    cfg.TPT.PREG_LOSS = False
+    cfg.TPT.N_CLS = 126
+    cfg.TPT.EMA = 0.9
+    cfg.TPT.RESET_STEPS = 100000
+    cfg.TPT.GROUPS = 1
+    cfg.TPT.EATA_TYPE = 'top5'
+
 
     # Config for MaPLe
     cfg.TRAINER.PROMPTALIGN = CN()

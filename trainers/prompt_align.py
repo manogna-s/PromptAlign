@@ -609,7 +609,7 @@ class PromptAlign(TrainerX):
             preprocess = transforms.Compose([
                 transforms.ToTensor(),
                 normalize])
-            data_transform = AugMixAugmenter(base_transform, preprocess, n_views=args.BATCH_SIZE-1, 
+            data_transform = AugMixAugmenter(base_transform, preprocess, n_views=args.N_VIEWS-1, 
                                             augmix=True)
             batchsize = 1
         else:
@@ -626,7 +626,7 @@ class PromptAlign(TrainerX):
         # print("number of test samples: {}".format(len(val_dataset)))
         val_loader = torch.utils.data.DataLoader(
                     val_dataset,
-                    batch_size=batchsize, shuffle=True,
+                    batch_size=batchsize, shuffle=False,
                     num_workers=8, pin_memory=True)
         
         return val_loader
@@ -637,21 +637,14 @@ class PromptAlign(TrainerX):
         """
         self.model.set_prompt_inits()   # Init with current prompts
         for name, param in self.model.named_parameters():
-            if not self.cfg.TPT.COCOOP: # MaPLe and CoOp
-                if "prompt_learner" not in name:
-                    param.requires_grad_(False)
-            else:
-                if "text_encoder" not in name:
-                    param.requires_grad_(False)
+            if "prompt_learner" not in name:
+                param.requires_grad_(False)
+
 
         # define optimizer
-        if self.cfg.TPT.COCOOP:
-            optimizer = None
-            optim_state = None
-        else:
-            trainable_param = self.model.prompt_learner.parameters()
-            optimizer = torch.optim.AdamW(trainable_param, self.cfg.TPT.LR)
-            optim_state = deepcopy(optimizer.state_dict())
+        trainable_param = self.model.prompt_learner.parameters()
+        optimizer = torch.optim.AdamW(trainable_param, self.cfg.TPT.LR)
+        optim_state = deepcopy(optimizer.state_dict())
 
         # setup automatic mixed-precision (Amp) loss scaling
         scaler = torch.cuda.amp.GradScaler(init_scale=1000)
@@ -752,7 +745,7 @@ class PromptAlign(TrainerX):
             batch_time.update(time.time() - end)
             end = time.time()
 
-            if (i+1) % 200 == 0:
+            if (i+1) % 100 == 0:
                 progress.display(i)
 
         progress.display_summary()
@@ -766,8 +759,6 @@ class PromptAlign(TrainerX):
             optimizer = torch.optim.AdamW([pgen_ctx], args.LR)
         
         selected_idx = None
-        state_dict = torch.load('finetune_model.pt')
-        model.load_state_dict(state_dict)
         for j in range(args.TTA_STEPS):
             with torch.cuda.amp.autocast():
                 if args.COCOOP:
