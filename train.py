@@ -28,6 +28,7 @@ import datasets.domainnet
 import trainers.prompt_align
 import trainers.coop_zs
 import trainers.group_ema
+import trainers.autogroup_ema
 
 
 from pdb import set_trace as stx

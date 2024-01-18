@@ -72,7 +72,7 @@ def copy_prompts(model, ema_model):
 
 
 @TRAINER_REGISTRY.register()
-class Group_EMA_EATA(PromptAlign):
+class AutoGroup_EMA_EATA(PromptAlign):
     def tpt(self):
         """
         Run Test-time prompt Tuning
@@ -81,11 +81,9 @@ class Group_EMA_EATA(PromptAlign):
         self.base_model = deepcopy(self.model)
         self.base_model.eval()
         
-        
         for name, param in self.model.named_parameters():
             if "prompt_learner" not in name:
                 param.requires_grad_(False)
-
         
         # define optimizer
         print(f'Using AdamW optimizer with learning rate:{self.cfg.TPT.LR}')
@@ -110,14 +108,14 @@ class Group_EMA_EATA(PromptAlign):
         label2class = json.load(open('data/domainnet/domainnet126_lists/label2class.json'))
 
         group_name = cfg.TPT.GROUPS
-        groups = torch.load(f'output/groups/{group_name}.pt')
+        n_groups = cfg.TPT.GROUPS
+        n_cls = 126
+        
+        # Setup meters, save ckpts, logs etc.        
         experiment = f'EMA{cfg.TPT.EMA}_lr{cfg.TPT.LR}_{group_name}'
-
         log_dir = f'output/evaluation/{cfg.TRAINER.NAME}/{group_name}/RESET{cfg.TPT.RESET_STEPS}/{cfg.TPT.EATA_TYPE}/seed{cfg.SEED}'
         os.makedirs(log_dir, exist_ok=True)
 
-        n_groups = len(groups)
-        
         group_meters_base = []
         group_meters_tta = []
         ema_update_idx = {}
@@ -126,7 +124,6 @@ class Group_EMA_EATA(PromptAlign):
             group_meters_tta.append(AverageMeter_TPT(f'Group{i}_Acc', ':6.2f', Summary.AVERAGE))
             ema_update_idx[i] = []
 
-        n_cls = 126
         cls_meters = []
         for i in range(n_cls):
             cls_meters.append(AverageMeter_TPT(f'Cls{i}_Acc', ':6.2f', Summary.AVERAGE))
@@ -136,7 +133,6 @@ class Group_EMA_EATA(PromptAlign):
             self.base_model.prompt_learner.compound_prompts_text[0].cpu(), self.base_model.prompt_learner.compound_prompts_text[1].cpu()]
 
         logs_all = {}
-
         
         batch_time = AverageMeter_TPT('Time', ':6.3f', Summary.NONE)
         base_top1 = AverageMeter_TPT('Base_Acc@1', ':6.2f', Summary.AVERAGE)
@@ -148,6 +144,8 @@ class Group_EMA_EATA(PromptAlign):
             len(val_loader),
             [batch_time, base_top1, aug_top1, top1, top5],
             prefix='Test: ')
+        
+        # print configs
         print("$"*40)
         print(f"Running for {cfg.TPT.BATCH_SIZE} Batch size")
         print(f"Running for {cfg.TPT.N_VIEWS} Augmented views")
@@ -172,25 +170,29 @@ class Group_EMA_EATA(PromptAlign):
         for i, batch in enumerate(val_loader):
             images, target = batch
             gt_class_idx = target.item()
-            for k in range(n_groups):
-                if gt_class_idx in groups[k]['idx']:
-                    sample_group_idx = k
-                    break
 
             batch_size = target.shape[0]
             target = target.to(self.device)
             images = torch.cat(images, dim=0).to(self.device)
             test_image = (images[0]).unsqueeze(0)
 
-            # test time adapt on single image  
-
-            model = deepcopy(group_models[sample_group_idx])
-            # model = copy_prompts(model, group_models[sample_group_idx])
+            scores = []
+            for k in range(n_groups):
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast():
+                        logits = group_models[k](test_image)
+                        score, _ = logits.softmax(1).max(1)
+                        scores.append(score)
+            scores = torch.cat(scores)
+            group_idx = scores.argmax().item()
+                
+            model = deepcopy(group_models[group_idx])
             
             params = [model.prompt_learner.ctx, model.prompt_learner.compound_prompts_text[0], model.prompt_learner.compound_prompts_text[1]]
             optimizer = torch.optim.AdamW(params, lr=cfg.TPT.LR)
             scaler = torch.cuda.amp.GradScaler(init_scale=1000)
             
+            # test time adapt on single image  
             outputs_all, outputs_sel = self.test_time_tuning(model, images, optimizer, scaler, cfg.TPT)
             
             # aggregate augmentation logits and predict
@@ -231,22 +233,25 @@ class Group_EMA_EATA(PromptAlign):
             ema_update_done = 0
             if cfg.TPT.EATA_TYPE == 'top5':
                 if tta_pred in base_top5:
-                    group_models[sample_group_idx] = update_ema_variables(group_models[sample_group_idx], model, cfg.TPT.EMA)
-                    ema_update_idx[sample_group_idx].append(i)
+                    group_models[group_idx] = update_ema_variables(group_models[group_idx], model, cfg.TPT.EMA)
+                    ema_update_idx[group_idx].append(i)
                     ema_update_done = 1
                 else: # then just give out base prediction
                     tta_score_vec[0, base_pred] += 1 # increase score for base pred idx by 1 so that it predicts as base pred
+            
+            # print(i, scores.cpu().data.numpy(), group_idx, ema_update_done>0)
+
 
             if cfg.TPT.EATA_TYPE == 'confidence' and base_score > 0.5 and tta_conf>base_score:
-                group_models[sample_group_idx] = update_ema_variables(group_models[sample_group_idx], model, cfg.TPT.EMA)
-                ema_update_idx[sample_group_idx].append(i)
+                group_models[group_idx] = update_ema_variables(group_models[group_idx], model, cfg.TPT.EMA)
+                ema_update_idx[group_idx].append(i)
                 ema_update_done = 1           
 
-            if (group_meters_base[sample_group_idx].count + 1) % cfg.TPT.RESET_STEPS == 0:
+            if (group_meters_base[group_idx].count + 1) % cfg.TPT.RESET_STEPS == 0:
                 with torch.no_grad():
                     model.reset()
-                    group_models[sample_group_idx].reset()
-                print(f'Resetting at step {i}; group_sample_count: {group_meters_base[sample_group_idx].count}; group_idx:{sample_group_idx}')
+                    group_models[group_idx].reset()
+                print(f'Resetting at step {i}; group_sample_count: {group_meters_base[group_idx].count}; group_idx:{group_idx}')
 
 
             # log everything
@@ -272,8 +277,8 @@ class Group_EMA_EATA(PromptAlign):
             top1.update(acc1[0], test_image.size(0))
             top5.update(acc5[0], test_image.size(0))
             cls_meters[gt_class_idx].update(acc1[0], test_image.size(0))
-            group_meters_base[sample_group_idx].update(base_acc1, test_image.size(0))
-            group_meters_tta[sample_group_idx].update(acc1[0], test_image.size(0))
+            group_meters_base[group_idx].update(base_acc1, test_image.size(0))
+            group_meters_tta[group_idx].update(acc1[0], test_image.size(0))
 
             
             # measure elapsed time
@@ -294,6 +299,14 @@ class Group_EMA_EATA(PromptAlign):
                     ckpt[f'group{group_idx}'] = params
                 ckpt_all[i] = ckpt
                 torch.save(ckpt, f'{log_dir}/{experiment}_ema_prompts.pt')
+                
+                group_acc_df = pd.DataFrame(columns=['group_idx', 'n_samples', 'group_base_acc', 'group_tta_acc'])
+                for k in range(n_groups):
+                    if group_meters_base[k].count > 0:
+                        group_info = {'group_idx': [k], 'n_samples': [group_meters_base[k].count], \
+                            'group_base_acc': [group_meters_base[k].avg.item()], 'group_tta_acc': [group_meters_tta[k].avg.item()]}
+                        group_acc_df = pd.concat([group_acc_df, pd.DataFrame(group_info)], ignore_index=True)
+                print(group_acc_df)
 
             
         # save sample wise data
