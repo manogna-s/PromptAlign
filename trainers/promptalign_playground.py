@@ -271,7 +271,12 @@ class PromptAlign_Playground(PromptAlign):
         selected_idx = None
         for j in range(args.TTA_STEPS):
             with torch.cuda.amp.autocast():
-                outputs_all = model(inputs)
+                # outputs_all = model(inputs)
+                image_features, text_features = model.get_image_txt_features(inputs)
+
+                image_f_norm = image_features / image_features.norm(dim=-1, keepdim=True)
+                text_f_norm = text_features / text_features.norm(dim=-1, keepdim=True)
+                outputs_all = model.logit_scale.exp() * image_f_norm @ text_f_norm.t()
 
                 output, selected_idx = self.select_confident_samples_batch(outputs_all, args.TPT_THRESHOLD, args.ALIGN_THRESHOLD, batch_size=args.BATCH_SIZE)                    
 
@@ -322,10 +327,33 @@ class PromptAlign_Playground(PromptAlign):
                 # loss_orth = sim[~torch.eye(*sim.shape,dtype = torch.bool)].mean()
                 # loss += loss_orth
                 
-                loss_m = self.margin_loss(output[selected_idx[k]])
-                loss += loss_m
-                if loss_m>0: 
-                    print(loss_m.item())
+                # loss_m = self.margin_loss(output[selected_idx[k]])
+                # loss += loss_m
+                # if loss_m>0: 
+                #     print(loss_m.item())
+
+
+                # stochastic classifier
+                # image_features, text_features = model.get_image_txt_features(inputs)
+                sigma = torch.zeros_like(text_features).to(text_features.device)
+                sigma = F.softplus(sigma - 2) # when sigma=0, softplus(sigma-4)=0.0181
+                text_features = sigma * torch.randn_like(text_features) + text_features
+
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                logits = model.logit_scale.exp() * image_f_norm @ text_features.t()
+
+                scores1 = outputs_all[selected_idx][0].softmax(-1)
+                scores2 = logits[selected_idx][0].softmax(-1)
+                loss_sc = torch.sum(1 - scores1 @ scores2.T)
+                loss += loss_sc
+
+
+                # scores = (outputs).softmax(1)
+                # p_t, p_aug = scores[0], scores[1:]
+                # loss_aug = - torch.sum(p_aug @ p_t.T)
+
+                # stochastic classifier
+
                 
 
             optimizer.zero_grad()
@@ -339,7 +367,7 @@ class PromptAlign_Playground(PromptAlign):
 
 
     def select_confident_samples_batch(self, logits, topTPT, topAlign, batch_size=1):
-        n_select = {1:1, 4:2, 8:3, 16:3, 32:3, 64:6}
+        n_select = {1:1, 4:2, 8:3, 16:3, 32:3, 64:4}
         batch_entropy = -(logits.softmax(1) * logits.log_softmax(1)).sum(1)
         n_aug = int(batch_entropy.size()[0] / batch_size) 
         batch_entropy_reshaped = batch_entropy.reshape((n_aug, batch_size))

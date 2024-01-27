@@ -504,11 +504,11 @@ class PlayGround(PromptAlign):
         set_difference = set_diff_1d(indices_set1, unique_indices)
 
         
-        outputs_sel = outputs[:, set_difference] 
+        outputs_sel = outputs[:, unique_indices] 
         scores = outputs_sel.softmax(1)
         p_t, p_aug = scores[0], scores[1:]
-        loss_aug = torch.mean(1 - p_aug @ p_t.T)
-        # loss_aug = -(scores * torch.log(scores)).sum(dim=-1)
+        # loss_aug = torch.mean(1 - p_aug @ p_t.T)
+        loss_aug = self.avg_entropy(outputs_sel)
         return loss_aug
 
 

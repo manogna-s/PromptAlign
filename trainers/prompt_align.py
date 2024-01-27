@@ -326,13 +326,24 @@ class CustomCLIP(nn.Module):
     
 
     def get_text_features(self):
-        with torch.no_grad():
-            tokenized_prompts = self.tokenized_prompts
+        # with torch.no_grad():
+        tokenized_prompts = self.tokenized_prompts
 
-            prompts, shared_ctx, deep_compound_prompts_text, deep_compound_prompts_vision = self.prompt_learner()
-            text_features = self.text_encoder(prompts, tokenized_prompts, deep_compound_prompts_text)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        prompts, shared_ctx, deep_compound_prompts_text, deep_compound_prompts_vision = self.prompt_learner()
+        text_features = self.text_encoder(prompts, tokenized_prompts, deep_compound_prompts_text)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         return text_features
+
+    def get_image_txt_features(self, image):
+        tokenized_prompts = self.tokenized_prompts
+        logit_scale = self.logit_scale.exp()
+
+        prompts, shared_ctx, deep_compound_prompts_text, deep_compound_prompts_vision = self.prompt_learner()
+        text_features = self.text_encoder(prompts, tokenized_prompts, deep_compound_prompts_text)
+        image_features = self.image_encoder(image.type(self.dtype), shared_ctx, deep_compound_prompts_vision)
+
+        return [image_features, text_features]
+
     
     # restore the initial state of the prompt_learner (tunable prompt)
     def reset(self):

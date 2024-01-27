@@ -29,7 +29,12 @@ import trainers.prompt_align
 import trainers.coop_zs
 import trainers.group_ema
 import trainers.autogroup_ema
-
+import trainers.autogroup_ema_p5
+import trainers.playground
+import trainers.promptalign_playground
+import trainers.last_attempt
+import trainers.last_attemptv2
+import trainers.sample_analysis
 
 from pdb import set_trace as stx
 
